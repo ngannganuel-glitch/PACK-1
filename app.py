@@ -22,22 +22,28 @@ def cached_fund(s): return core.get_fund(s)
 
 # ---------------- Sidebar & dữ liệu ----------------
 with st.sidebar:
-    st.header("Dữ liệu")
-    refresh = st.button("🔄 Tải lại toàn bộ dữ liệu DNSE", use_container_width=True)
-    mode = st.radio("Cách phân ngành", ["ICB (chuẩn)", "Tự động theo tương quan giá"])
-    k = st.slider("Số cụm (khi phân tự động)", 8, 30, 18)
+    st.header("Chọn cổ phiếu")
+    sym = st.text_input("Nhập BẤT KỲ mã cổ phiếu (HOSE/HNX/UPCOM)", "FPT").upper().strip()
+    st.caption("Nhấn Enter để phân tích. Hệ thống tự tìm ngành & các mã cùng ngành.")
+    refresh = st.button("🔄 Tải lại dữ liệu thị trường", use_container_width=True)
     min_liq = st.number_input("Lọc thanh khoản tối thiểu (tỷ/phiên)", 0.0, 100.0, 2.0)
 
-if "data" not in st.session_state or refresh:
-    bar = st.progress(0.0, "Đang tải dữ liệu toàn thị trường từ DNSE (lần đầu mất vài phút, sau đó dùng cache 12 giờ)...")
+if "ctx" not in st.session_state or refresh:
+    bar = st.progress(0.0, "Lần đầu: tải ngữ cảnh thị trường từ DNSE (~1 phút, sau đó dùng cache 12 giờ)...")
     try:
-        st.session_state["data"] = core.load_market(refresh=refresh, progress=lambda p: bar.progress(p))
+        st.session_state["ctx"] = core.load_context(refresh=refresh, progress=lambda p: bar.progress(p))
     except Exception as e:
         bar.empty(); st.error(str(e)); st.stop()
-    bar.empty()
+    bar.empty(); st.session_state.pop("sym", None)
+if st.session_state.get("sym") != sym:
+    try:
+        with st.spinner(f"Đang tải dữ liệu DNSE cho {sym} và các mã cùng ngành..."):
+            st.session_state["data"] = core.load_stock(sym, st.session_state["ctx"]); st.session_state["sym"] = sym
+    except Exception as e:
+        st.error(str(e)); st.stop()
 data = st.session_state["data"]
 close, idx = data["close"], data["idx"]
-ind, val = core.assign_industry(data, "ICB" if mode.startswith("ICB") else "AUTO", k)
+ind, val = core.assign_industry(data, "ICB")
 m = core.build_metrics(close, val, idx)
 factors, score = core.score_stocks(m, ind)
 m["score"], m["ind"] = score, ind.reindex(m.index)
@@ -45,7 +51,7 @@ it_all, curves = core.industry_table(close, val, m, ind, idx)
 glob = cached_glob()
 reg = core.macro_view(idx, close, m, val, glob)
 asof = close.index[-1]
-st.caption(f"{close.shape[1]:,} cổ phiếu có dữ liệu · {len(it_all)} nhóm ngành · phiên cuối {asof:%d/%m/%Y}")
+st.caption(f"Mẫu {close.shape[1]} cổ phiếu (gồm {sym} + mã cùng ngành + mã đại diện các ngành) · {len(it_all)} nhóm ngành · phiên cuối {asof:%d/%m/%Y}")
 
 c = st.columns(5)
 i1 = idx["close"]
@@ -55,7 +61,7 @@ c[2].metric("% mã trên SMA50", f"{reg['b50']:.0%}")
 c[3].metric("Điểm thị trường", f"{reg['score']:.0f}/100")
 c[4].metric("Trạng thái", reg["regime"])
 
-tabs = st.tabs(["🌐 Vĩ mô & Thị trường", "🏭 Ngành", "🔎 Cổ phiếu", "🎯 Bộ lọc cơ hội", "📄 Báo cáo PDF"])
+tabs = st.tabs(["🌐 Vĩ mô & Thị trường", "🏭 Ngành", "🔎 Cổ phiếu", "📄 Báo cáo PDF"])
 
 # ---------------- Tab 1: vĩ mô ----------------
 with tabs[0]:
@@ -64,7 +70,7 @@ with tabs[0]:
         h = m[m.gtgd >= max(min_liq, .5)].reset_index(names="Mã")
         fig = px.treemap(h, path=[px.Constant("Thị trường"), "ind", "Mã"], values="gtgd", color="ret1d", color_continuous_scale="RdYlGn",
                          range_color=(-.07, .07))
-        fig.update_layout(height=520, margin=dict(l=0, r=0, t=25, b=0), title="Bản đồ nhiệt thị trường (kích thước = GTGD, màu = % 1 ngày)")
+        fig.update_layout(height=520, margin=dict(l=0, r=0, t=25, b=0), title="Bản đồ nhiệt mẫu thị trường (kích thước = GTGD, màu = % 1 ngày)")
         st.plotly_chart(fig, use_container_width=True)
     with b:
         st.subheader("Nhận định vĩ mô")
@@ -99,8 +105,6 @@ with tabs[1]:
 
 # ---------------- Tab 3: cổ phiếu ----------------
 with tabs[2]:
-    syms = sorted(close.columns)
-    sym = st.selectbox("Mã cổ phiếu (toàn bộ mã có dữ liệu DNSE)", syms, index=syms.index("FPT") if "FPT" in syms else 0)
     df = core.add_ind(data["raw"][sym]); r = m.loc[sym]; ind_name = ind[sym]
     it = it_all.loc[ind_name] if ind_name in it_all.index else None
     f = cached_fund(sym); nw = cached_news(sym); ns = nw["Điểm"].sum() if len(nw) else 0
@@ -138,25 +142,8 @@ with tabs[2]:
     for _, n in nw.iterrows():
         st.markdown(f"{'🟢' if n['Điểm'] > 0 else '🔴' if n['Điểm'] < 0 else '⚪'} [{n['Tiêu đề']}]({n['Link']})")
 
-# ---------------- Tab 4: bộ lọc ----------------
+# ---------------- Tab 4: PDF ----------------
 with tabs[3]:
-    cols = st.columns(4)
-    sel_ind = cols[0].multiselect("Ngành", list(it_all.index))
-    min_sc = cols[1].slider("Điểm tối thiểu", 0, 100, 60)
-    only_up = cols[2].checkbox("Chỉ mã trên SMA50 & SMA200", True)
-    rsi_max = cols[3].slider("RSI tối đa", 30, 100, 75)
-    s = m[(m.gtgd >= min_liq) & (m.score >= min_sc) & (m.rsi <= rsi_max)]
-    if sel_ind: s = s[s.ind.isin(sel_ind)]
-    if only_up: s = s[(s.a50 == 1) & (s.a200 == 1)]
-    s = s.sort_values("score", ascending=False)
-    st.write(f"**{len(s)}** mã thỏa điều kiện")
-    st.dataframe(s[["ind", "price", "ret1m", "ret3m", "ret12m", "vol", "rsi", "gtgd", "flow", "score"]].rename(columns={**core.LABEL, "ind": "Ngành"})
-                 .style.format({"Giá": "{:,.2f}", "% 1 tháng": "{:+.1%}", "% 3 tháng": "{:+.1%}", "% 12 tháng": "{:+.1%}", "Biến động": "{:.0%}", "RSI": "{:.0f}",
-                                "GTGD 20D (tỷ)": "{:,.1f}", "Dòng tiền (20D/60D)": "{:+.0%}", "Điểm": "{:.0f}"}).background_gradient(subset=["Điểm"], cmap="RdYlGn"),
-                 use_container_width=True, height=560)
-
-# ---------------- Tab 5: PDF ----------------
-with tabs[4]:
     st.write(f"Báo cáo PDF cho **{sym}**: tóm tắt & luận điểm, vĩ mô, phân tích ngành, kỹ thuật, rủi ro, so sánh cùng ngành, top cơ hội, tin tức.")
     if st.button("Tạo báo cáo PDF", type="primary"):
         with st.spinner("Đang dựng báo cáo..."):
