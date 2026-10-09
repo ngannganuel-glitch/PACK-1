@@ -96,7 +96,7 @@ def make_report(x):
     # ---------- Ngành ----------
     t = x["ind_table"]
     S_ += [P("3. Phân tích ngành", "h"),
-           P(f"Hệ thống tự phân {len(t)} nhóm ngành từ toàn bộ cổ phiếu niêm yết có dữ liệu DNSE. Chỉ số ngành là chỉ số bình quân đều của các mã trong ngành.")]
+           P(f"Hệ thống phân {len(t)} nhóm ngành từ mẫu các mã cùng ngành và mã đại diện các ngành khác (dữ liệu DNSE). Chỉ số ngành là chỉ số bình quân đều của các mã trong ngành.")]
     if it is not None:
         S_.append(P(f"Ngành <b>{ind_name}</b> xếp hạng <b>{list(t.index).index(ind_name) + 1}/{len(t)}</b>, nhóm <b>{it['rating']}</b>: "
                     f"lợi suất 3 tháng {pct(it['ret3m'])} (so với VN-Index {pct(it['rs3m'])}), {it['a50']:.0%} số mã trên SMA50, "
@@ -146,7 +146,7 @@ def make_report(x):
     S_.append(tbl([["Mã", "Giá", "% 3T", "% 12T", "Biến động", "GTGD (tỷ)", "Điểm"]] +
                   [[i, num(a.price), pct(a.ret3m), pct(a.ret12m), f"{a.vol:.0%}", num(a.gtgd, 1), f"{a.score:.0f}"] for i, a in pe.iterrows()],
                   [2, 2.4, 2.4, 2.4, 2.6, 3, 2.2], hl_row=(list(pe.index).index(sym) + 1) if sym in pe.index else None))
-    S_ += [P("6. Top cơ hội toàn thị trường (lọc thanh khoản ≥ 2 tỷ/phiên)", "h")]
+    S_ += [P("6. Mã nổi bật trong mẫu thị trường đã phân tích (thanh khoản ≥ 2 tỷ/phiên)", "h")]
     sc = x["screen"]
     S_.append(tbl([["Mã", "Ngành", "Giá", "% 3T", "% 12T", "Điểm"]] +
                   [[i, str(a.ind)[:34], num(a.price), pct(a.ret3m), pct(a.ret12m), f"{a.score:.0f}"] for i, a in sc.iterrows()], [1.8, 7, 2, 2, 2, 2.2]))
