@@ -9,6 +9,10 @@ H = {"User-Agent": "Mozilla/5.0"}
 ENTRADE = "https://services.entrade.com.vn/chart-api/v2/ohlcs/{}"   # API dữ liệu giá công khai của DNSE
 POS = ["tăng", "lãi", "kỷ lục", "vượt", "tích cực", "mua ròng", "khởi sắc", "cổ tức", "tăng trưởng", "bứt phá"]
 NEG = ["giảm", "lỗ", "bán ròng", "vi phạm", "thanh tra", "khởi tố", "nợ xấu", "sụt", "cảnh báo", "đình chỉ", "phạt"]
+FALLBACK = {"Ngân hàng": "VCB BID CTG TCB MBB ACB VPB STB HDB TPB", "Công nghệ thông tin": "FPT CMG ELC",
+            "Bán lẻ": "MWG PNJ DGW FRT", "Thực phẩm & đồ uống": "VNM MSN SAB KDC", "Tài nguyên cơ bản": "HPG HSG NKG",
+            "Bất động sản": "VHM VIC NVL KDH DXG NLG", "Dịch vụ tài chính": "SSI VND HCM VCI", "Dầu khí": "GAS PLX PVD BSR",
+            "Điện nước": "POW REE NT2 PC1", "Xây dựng & vật liệu": "VCG CTD HT1 DPR"}
 LABEL = {"price": "Giá", "ret1d": "% 1 ngày", "ret1m": "% 1 tháng", "ret3m": "% 3 tháng", "ret6m": "% 6 tháng",
          "ret12m": "% 12 tháng", "vol": "Biến động", "beta": "Beta", "dd": "Cách đỉnh 52T", "rsi": "RSI",
          "gtgd": "GTGD 20D (tỷ)", "flow": "Dòng tiền (20D/60D)", "score": "Điểm"}
@@ -68,9 +72,10 @@ def load_universe():
         base = pd.DataFrame({"symbol": syms, "exchange": ""})
     if base is None and icb is not None:
         base = icb[["symbol"]].assign(exchange="")
-    if base is None:
-        raise RuntimeError("Không lấy được danh sách mã. Hãy tạo file symbols.txt (mỗi dòng 1 mã) cạnh app.py.")
-    u = base.drop_duplicates("symbol")
+    if base is None:   # dự phòng: bộ mã đại diện các ngành (khi không lấy được danh sách đầy đủ)
+        rows = [(s, "", g) for g, l in FALLBACK.items() for s in l.split()]
+        base = pd.DataFrame(rows, columns=["symbol", "exchange", "icb"]); icb = base[["symbol", "icb"]]
+    u = base[["symbol", "exchange"]].drop_duplicates("symbol")
     u = u.merge(icb, on="symbol", how="left") if icb is not None else u.assign(icb=np.nan)
     return u[u["symbol"].str.fullmatch(r"[A-Z0-9]{3}")].reset_index(drop=True)
 
@@ -97,6 +102,62 @@ def load_market(refresh=False, progress=None, workers=12, days=800):
     data = {"close": close, "vol": vol, "raw": {s: raw[s] for s in close.columns}, "idx": idx, "uni": uni, "time": time.time()}
     pickle.dump(data, open(f, "wb"))
     return data
+
+
+def _fetch_many(syms, days=800, workers=12, progress=None):
+    out = {}
+    with ThreadPoolExecutor(workers) as ex:
+        for i, (s, d) in enumerate(zip(syms, ex.map(lambda s: dnse_ohlc(s, days), syms))):
+            if d is not None and len(d) > 120:
+                out[s] = d
+            if progress:
+                progress((i + 1) / len(syms))
+    return out
+
+
+def _assemble(raw, idx, uni):
+    close = pd.DataFrame({s: d["close"] for s, d in raw.items()}).sort_index()
+    vol = pd.DataFrame({s: d["volume"] for s, d in raw.items()}).sort_index()
+    return {"close": close, "vol": vol, "raw": raw, "idx": idx, "uni": uni.reindex(close.columns)}
+
+
+def load_context(refresh=False, progress=None, per_ind=5, cand=10, days=800):
+    """Ngữ cảnh thị trường (tải 1 lần, cache 12h): VN-Index + mẫu ~5 mã thanh khoản cao nhất mỗi ngành."""
+    f = os.path.join(CACHE, "context.pkl")
+    if os.path.exists(f) and not refresh and time.time() - os.path.getmtime(f) < 12 * 3600:
+        return pickle.load(open(f, "rb"))
+    u = load_universe()
+    if u["icb"].notna().mean() < .5:
+        u = u.drop(columns="icb").merge(pd.DataFrame([(s, g) for g, l in FALLBACK.items() for s in l.split()], columns=["symbol", "icb"]), on="symbol", how="left")
+    cands = [s for _, g in u.dropna(subset=["icb"]).groupby("icb") for s in g["symbol"].tolist()[:cand]]
+    got = _fetch_many(cands, days, progress=progress); raw = {}
+    for g, grp in u.dropna(subset=["icb"]).groupby("icb"):
+        have = [s for s in grp["symbol"] if s in got]
+        have.sort(key=lambda k: (got[k].close * got[k].volume).tail(60).mean(), reverse=True)
+        raw.update({k: got[k] for k in have[:per_ind]})
+    idx = dnse_ohlc("VNINDEX", days, "index")
+    if idx is None or not raw:
+        raise RuntimeError("Không gọi được API DNSE (kiểm tra kết nối mạng).")
+    ctx = {"raw": raw, "idx": idx, "uni": u.set_index("symbol")}
+    pickle.dump(ctx, open(f, "wb")); return ctx
+
+
+def load_stock(sym, ctx, extra=15, days=800):
+    """Mã bất kỳ: tải mã đó + các mã cùng ngành (tự tìm) rồi ghép với ngữ cảnh thị trường."""
+    s = dnse_ohlc(sym, days)
+    if s is None or len(s) < 120:
+        raise ValueError(f"Không có đủ dữ liệu DNSE cho mã '{sym}' (cần ≥120 phiên). Kiểm tra lại mã.")
+    raw, uni = dict(ctx["raw"]), ctx["uni"].copy()
+    raw[sym] = s
+    if sym not in uni.index:
+        uni.loc[sym, "icb"] = np.nan
+    g = uni.loc[sym, "icb"]
+    if pd.notna(g):
+        mates = [x for x in uni.index[uni["icb"] == g] if x not in raw][:extra * 2]
+        got = _fetch_many(mates, days)
+        top = sorted(got, key=lambda k: (got[k].close * got[k].volume).tail(60).mean(), reverse=True)[:extra]
+        raw.update({k: got[k] for k in top})
+    return _assemble(raw, ctx["idx"], uni)
 
 
 # ------------------------------ 2. PHÂN NGÀNH TỰ ĐỘNG ------------------------------
@@ -219,7 +280,7 @@ def macro_view(idx, close, m, val, glob):
     regime = "THUẬN LỢI" if score >= 70 else "TRUNG TÍNH / PHÂN HÓA" if score >= 45 else "RỦI RO CAO"
     txt = [f"VN-Index {L:,.1f} điểm, {'trên' if L > s50 else 'dưới'} SMA50 ({s50:,.0f}) và {'trên' if L > s200 else 'dưới'} SMA200 ({s200:,.0f}); "
            f"cách đỉnh 52 tuần {L / c.tail(252).max() - 1:.1%}.",
-           f"Độ rộng thị trường: {b50:.0%} cổ phiếu trên SMA50, {b200:.0%} trên SMA200; phiên gần nhất {adv} mã tăng/{dec} mã giảm; "
+           f"Độ rộng thị trường (mẫu {len(m)} mã đại diện các ngành): {b50:.0%} cổ phiếu trên SMA50, {b200:.0%} trên SMA200; phiên gần nhất {adv} mã tăng/{dec} mã giảm; "
            f"{hi} mã gần đỉnh 52 tuần so với {lo} mã gần đáy.",
            f"Thanh khoản 20 phiên {'cao hơn' if liq > 0 else 'thấp hơn'} trung bình 60 phiên {abs(liq):.0%}; "
            f"biến động 20 phiên {v20:.0%} ({'thấp hơn' if v20 < v1y else 'cao hơn'} mức 1 năm {v1y:.0%})."]
